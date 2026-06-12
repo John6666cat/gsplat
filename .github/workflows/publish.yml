@@ -4,20 +4,31 @@ name: Build and Release Wheels
 
 on:
   release:
-    types: [created]
+    # Use published so releases created from drafts and prereleases are handled reliably.
+    types: [published]
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: GitHub Release tag to upload assets to. If omitted, the selected ref must be a tag.
+        required: false
+        type: string
+      create_release:
+        description: Create the GitHub Release if it does not already exist.
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
 jobs:
-  # Build the wheels using the reusable building workflow
+  # Build the wheels using the reusable building workflow.
   build_wheels:
     name: Call reusable building workflow
-    uses: ./.github/workflows/building.yml  
+    uses: ./.github/workflows/building.yml
 
-  create_release_and_upload_packages:
-    name: Upload to GitHub Release
+  upload_packages:
+    name: Upload packages to GitHub Release
     needs: [build_wheels]
     runs-on: ubuntu-latest
     strategy:
@@ -30,48 +41,121 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Download packages
-        id: download_artifacts
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        env:
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG_NAME: ${{ github.event.inputs.tag_name }}
+          INPUT_CREATE_RELEASE: ${{ github.event.inputs.create_release }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          tag_name="${EVENT_RELEASE_TAG:-}"
+          if [ -z "$tag_name" ]; then
+            tag_name="${INPUT_TAG_NAME:-}"
+          fi
+          if [ -z "$tag_name" ] && [ "${REF_TYPE:-}" = "tag" ]; then
+            tag_name="${REF_NAME:-}"
+          fi
+          if [ -z "$tag_name" ]; then
+            echo "Unable to determine the release tag." >&2
+            echo "For workflow_dispatch, either run this workflow from a tag ref or set the tag_name input." >&2
+            exit 1
+          fi
+
+          create_release="${INPUT_CREATE_RELEASE:-false}"
+          if [ "${{ github.event_name }}" = "release" ]; then
+            create_release="false"
+          fi
+
+          echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
+          echo "create_release=$create_release" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: $tag_name"
+          echo "Create missing release: $create_release"
+
+      - name: Download compiled wheels
         uses: actions/download-artifact@v4
         with:
           # The unique artifact names from building.yml all start with
-          # "compiled_wheels_python${{ matrix.python-version }}" so this pattern
-          # will match them all and merge them into the 'dist' directory.
+          # "compiled_wheels_python${{ matrix.python-version }}", so this pattern
+          # matches them all and merges them into the dist directory.
           pattern: compiled_wheels_python${{ matrix.python-version }}*
           path: dist
           merge-multiple: true
 
-      - name: Upload packages to latest GitHub Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download source distribution and no-binary wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: pypi_packages
+          path: dist
+
+      - name: Inspect packages
+        id: packages
+        shell: bash
         run: |
-          echo "Fetching latest release info (unauthenticated)..."
-          release_info=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            https://api.github.com/repos/nerfstudio-project/gsplat/releases/latest)
+          set -euxo pipefail
+          shopt -s nullglob
+          files=(dist/*.whl dist/*.tar.gz)
+          printf 'Package count: %s\n' "${#files[@]}"
+          printf '%s\n' "${files[@]}"
+          test "${#files[@]}" -gt 0
 
-          # Extract the "upload_url" field and strip the {?name,label} part
-          upload_url=$(echo "$release_info" | grep '"upload_url":' | cut -d '"' -f 4 | sed 's/{.*//')
-          echo "Upload URL: $upload_url"
+      - name: Ensure GitHub Release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          CREATE_RELEASE: ${{ steps.release.outputs.create_release }}
+        shell: bash
+        run: |
+          set -euxo pipefail
 
-          for file in ./dist/*.*; do
-            echo "Uploading $file..."
-            filename=$(basename "$file")
-            encoded_filename=$(echo "$filename" | sed 's/+/%2B/g')
-            curl -X POST \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Content-Type: application/zip" \
-              --data-binary @"$file" \
-              "$upload_url?name=$encoded_filename"
-          done
-          echo "Upload complete." 
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists."
+          elif [ "$CREATE_RELEASE" = "true" ]; then
+            gh release create "$TAG_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG_NAME" \
+              --notes "Automated release for $TAG_NAME"
+          else
+            echo "Release $TAG_NAME does not exist." >&2
+            echo "Create the release first, or rerun workflow_dispatch with create_release=true." >&2
+            exit 1
+          fi
+
+      - name: Upload packages to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          shopt -s nullglob
+          files=(dist/*.whl dist/*.tar.gz)
+          gh release upload "$TAG_NAME" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
 
   generate_simple_index_pages:
     name: Generate Simple Index Pages
-    needs: [create_release_and_upload_packages]
+    needs: [upload_packages]
     runs-on: ubuntu-latest
+    # The upstream project publishes docs.gsplat.studio. Forks should not deploy that CNAME by default.
+    if: ${{ github.repository == 'nerfstudio-project/gsplat' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install requests jinja2
 
       - name: Generate Simple Index Pages
         run: python .github/workflows/generate_simple_index_pages.py --outdir ./whl

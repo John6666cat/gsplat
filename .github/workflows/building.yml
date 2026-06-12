@@ -1,6 +1,7 @@
 name: Build Wheels
 
 on: [workflow_call, workflow_dispatch]
+
 jobs:
   build_sdist:
     name: Build source distribution and no binary wheel
@@ -9,21 +10,35 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
       - name: Strip unsupported tags in README
         run: |
           sed -i '/<!-- pypi-strip -->/,/<!-- \/pypi-strip -->/d' README.md
+
       - name: Build sdist
         run: BUILD_NO_CUDA=1 pipx run build --sdist
+
       - name: Build wheel with no binaries
         run: BUILD_NO_CUDA=1 python setup.py bdist_wheel --dist-dir=dist
+
+      - name: Validate source distribution and no-binary wheel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find dist -maxdepth 1 -type f -print
+          test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+
       - uses: actions/upload-artifact@v4
         with:
           name: pypi_packages
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.whl
+          if-no-files-found: error
 
   build_wheels:
     runs-on: ${{ matrix.os }}
-    environment: production
 
     strategy:
       fail-fast: false
@@ -129,8 +144,16 @@ jobs:
           cd ..
         shell: bash
 
+      - name: Validate compiled wheel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find dist -maxdepth 1 -type f -name '*.whl' -print
+          test -n "$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+
       - uses: actions/upload-artifact@v4
         with:
           # Include unique matrix values to avoid name collisions.
           name: compiled_wheels_python${{ matrix.python-version }}-${{ matrix.os }}-${{ matrix.torch-version }}-${{ matrix.cuda-version }}
           path: dist/*.whl
+          if-no-files-found: error

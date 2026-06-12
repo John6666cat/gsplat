@@ -13,66 +13,95 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import requests
-import os
 import argparse
-from jinja2 import Template
+import os
 import re
 
-# Automatically get the repository name in the format "owner/repo" from the GitHub workflow environment
+import requests
+from jinja2 import Template
+
+
 GITHUB_REPO = os.getenv("GITHUB_REPOSITORY")
+GITHUB_API_URL = os.getenv("GITHUB_API_URL", "https://api.github.com")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+
+WHEEL_FILENAME_PATTERN = re.compile(
+    r"^(?P<name>[\w\d_.]+)-"
+    r"(?P<version>[\w\d.!+_]+)-"
+    r"(?P<python_tag>[\w\d_.]+)-"
+    r"(?P<abi_tag>[\w\d_.]+)-"
+    r"(?P<platform_tag>[\w\d_.]+)\.whl$"
+)
+
+
+def github_headers():
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return headers
+
+
+def github_get_paginated(url):
+    headers = github_headers()
+    params = {"per_page": 100}
+
+    while url:
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to fetch GitHub API data: {response.status_code} {response.text}"
+            )
+
+        yield from response.json()
+
+        url = response.links.get("next", {}).get("url")
+        params = None
+
+
+def parse_wheel_filename(filename):
+    match = WHEEL_FILENAME_PATTERN.match(filename)
+    if not match:
+        raise ValueError(f"Invalid wheel filename: {filename}")
+
+    version = match.group("version")
+    local_version = None
+    if "+" in version:
+        _, local_version = version.split("+", 1)
+
+    return {
+        "package_name": match.group("name"),
+        "local_version": local_version,
+    }
 
 
 def list_python_wheels():
-    # GitHub API URL for releases
-    releases_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
+    if not GITHUB_REPO:
+        raise RuntimeError("GITHUB_REPOSITORY is not set")
 
-    response = requests.get(releases_url)
-
-    if response.status_code != 200:
-        raise Exception(
-            f"Failed to fetch releases: {response.status_code} {response.text}"
-        )
-
-    releases = response.json()
-
+    releases_url = f"{GITHUB_API_URL}/repos/{GITHUB_REPO}/releases"
     wheel_files = []
 
-    # Iterate through releases and assets
-    for release in releases:
-        assets = release.get("assets", [])
-        for asset in assets:
+    for release in github_get_paginated(releases_url):
+        for asset in release.get("assets", []):
             filename = asset["name"]
-            if filename.endswith(".whl"):
-                pattern = r"^(?P<name>[\w\d_.]+)-(?P<version>[\d.]+)(?P<local>\+[\w\d.]+)?-(?P<python_tag>[\w]+)-(?P<abi_tag>[\w]+)-(?P<platform_tag>[\w]+)\.whl"
+            if not filename.endswith(".whl"):
+                continue
 
-                match = re.match(pattern, filename)
-
-                if match:
-                    local_version = match.group("local")
-                    if local_version:
-                        local_version = local_version.lstrip(
-                            "+"
-                        )  # Return the local version without the '+' sign
-                    else:
-                        local_version = None
-                else:
-                    raise ValueError(f"Invalid wheel filename: {filename}")
-                wheel_files.append(
-                    {
-                        "release_name": release["name"],
-                        "wheel_name": asset["name"],
-                        "download_url": asset["browser_download_url"],
-                        "package_name": match.group("name"),
-                        "local_version": local_version,
-                    }
-                )
+            parsed_filename = parse_wheel_filename(filename)
+            wheel_files.append(
+                {
+                    "release_name": release.get("name") or release.get("tag_name"),
+                    "wheel_name": filename,
+                    "download_url": asset["browser_download_url"],
+                    "package_name": parsed_filename["package_name"],
+                    "local_version": parsed_filename["local_version"],
+                }
+            )
 
     return wheel_files
 
 
 def generate_simple_index_htmls(wheels, outdir):
-    # Jinja2 template as a string
     template_versions_str = """
     <!DOCTYPE html>
     <html>
@@ -98,38 +127,34 @@ def generate_simple_index_htmls(wheels, outdir):
     </html>
     """
 
-    # Create a Jinja2 Template object from the string
     template_versions = Template(template_versions_str)
     template_packages = Template(template_packages_str)
 
-    # group the wheels by package name
     packages = {}
     for wheel in wheels:
         package_name = wheel["package_name"]
-        if package_name not in packages:
-            packages[package_name] = []
-        packages[package_name].append(wheel)
+        packages.setdefault(package_name, []).append(wheel)
 
-    # Render the HTML the list the package names
     html_content = template_packages.render(
-        package_names=[str(k) for k in packages.keys()]
+        package_names=[str(k) for k in sorted(packages.keys())]
     )
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, "index.html"), "w") as file:
         file.write(html_content)
 
-    # for each package, render the HTML to list the wheels
-    for package_name, wheels in packages.items():
-        html_page = template_versions.render(repo_name=GITHUB_REPO, wheels=wheels)
+    for package_name, package_wheels in packages.items():
+        html_page = template_versions.render(
+            repo_name=GITHUB_REPO, wheels=package_wheels
+        )
         os.makedirs(os.path.join(outdir, package_name), exist_ok=True)
         with open(os.path.join(outdir, package_name, "index.html"), "w") as file:
             file.write(html_page)
 
 
-def generate_all_pages():
+def generate_all_pages(outdir):
     wheels = list_python_wheels()
     if wheels:
-        print("Python Wheels found in releases:")
+        print("Python wheels found in releases:")
         for wheel in wheels:
             print(
                 f"Release: {wheel['release_name']}, Wheel: {wheel['wheel_name']}, URL: {wheel['download_url']}"
@@ -137,22 +162,18 @@ def generate_all_pages():
     else:
         print("No Python wheels found in the releases.")
 
-    # Generate Simple Index HTML pages the wheel with all local versions
-    generate_simple_index_htmls(wheels, outdir=args.outdir)
+    generate_simple_index_htmls(wheels, outdir=outdir)
 
-    # group wheels per local version
     wheels_per_local_version = {}
     for wheel in wheels:
         local_version = wheel["local_version"]
-        if local_version is not None and local_version not in wheels_per_local_version:
-            wheels_per_local_version[local_version] = []
-        wheels_per_local_version[local_version].append(wheel)
+        if local_version is None:
+            continue
+        wheels_per_local_version.setdefault(local_version, []).append(wheel)
 
-    # create a subdirectory for each local version
-    for local_version, wheels in wheels_per_local_version.items():
-        os.makedirs(os.path.join(args.outdir, local_version), exist_ok=True)
+    for local_version, local_version_wheels in wheels_per_local_version.items():
         generate_simple_index_htmls(
-            wheels, outdir=os.path.join(args.outdir, local_version)
+            local_version_wheels, outdir=os.path.join(outdir, local_version)
         )
 
 
@@ -164,4 +185,4 @@ if __name__ == "__main__":
         "--outdir", help="Output directory for the index pages", default="."
     )
     args = argparser.parse_args()
-    generate_all_pages()
+    generate_all_pages(args.outdir)
